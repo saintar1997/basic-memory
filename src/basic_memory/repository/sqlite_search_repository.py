@@ -332,11 +332,12 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         await self._prepare_vector_session(session)
         # Trigger: every SQLite prepare write, built-in sqlite-vec included.
         # Why: the plan comes from a read taken before this write. Other processes and
-        #   other repository instances (each request builds its own, so the asyncio lock
-        #   above is not shared) can refresh the note and publish a newer manifest in
-        #   between, and an older plan would then rewrite those chunk rows back to older
-        #   text. SQLite has one database-wide writer, so a write first is the
-        #   BEGIN IMMEDIATE of this transaction: the re-read it guards cannot go stale.
+        #   other repository instances (each request builds its own, and the asyncio lock
+        #   in _prepare_entity_write_scope is per instance) can refresh the note and
+        #   publish a newer manifest in between; an older plan would then rewrite those
+        #   chunk rows back to older text. SQLite has one database-wide writer, so a
+        #   write first acts as this transaction's BEGIN IMMEDIATE and the re-read it
+        #   guards cannot go stale.
         # Outcome: the caller re-reads source and manifest and applies only a current plan.
         await self._lock_external_vector_project(session, dialect_name="sqlite")
         return True
