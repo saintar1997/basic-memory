@@ -1,0 +1,402 @@
+--- a/src/basic_memory/models/knowledge.py
++++ b/src/basic_memory/models/knowledge.py
+@@ -156,10 +156,38 @@
+     @override
+     def __repr__(self) -> str:
+         return f"Entity(id={self.id}, external_id='{self.external_id}', name='{self.title}', type='{self.note_type}', checksum='{self.checksum}')"
+ 
+ 
++def entity_embeddings_enabled(entity: Entity) -> bool:
++    """Return whether semantic embeddings should be generated for this entity.
++
++    Shared policy: sync uses it to clear and skip opted-out notes, and the retrieval
++    inspector uses it so an opt-out is never reported as missing vector coverage.
++    """
++    if not entity.entity_metadata:
++        return True
++
++    embed_value = entity.entity_metadata.get("embed")
++    if embed_value is None:
++        return True
++    if isinstance(embed_value, bool):
++        return embed_value
++    if isinstance(embed_value, str):
++        normalized = embed_value.strip().lower()
++        if normalized in {"false", "0", "no", "off"}:
++            return False
++        if normalized in {"true", "1", "yes", "on"}:
++            return True
++    if isinstance(embed_value, (int, float)):
++        return bool(embed_value)
++
++    # Default unknown values to enabled so malformed metadata does not silently
++    # remove notes from semantic search.
++    return True
++
++
+ class NoteContent(Base):
+     """Materialized markdown content and sync state for a note entity."""
+ 
+     __tablename__ = "note_content"
+     __table_args__ = (
+--- a/src/basic_memory/repository/postgres_search_repository.py
++++ b/src/basic_memory/repository/postgres_search_repository.py
+@@ -122,14 +122,13 @@
+     - tsquery for query representation
+     - GIN indexes for performance
+     - ts_rank() function for relevance scoring
+     - JSONB containment operators for metadata search
+ 
+-    Note: This implementation uses UPSERT patterns (INSERT ... ON CONFLICT) instead of
+-    delete-then-insert to handle race conditions during parallel entity indexing.
+-    The partial unique index uix_search_index_permalink_project prevents duplicate
+-    permalinks per project.
++    Individual rows use UPSERT (INSERT ... ON CONFLICT). Bulk entity refreshes
++    replace the owned projection in one transaction. The partial unique index
++    uix_search_index_permalink_project prevents duplicate permalinks per project.
+     """
+ 
+     def __init__(
+         self,
+         session_maker,
+@@ -717,29 +716,38 @@
+     # Index / bulk index overrides (Postgres UPSERT)
+     # ------------------------------------------------------------------
+ 
+     @override
+     async def bulk_index_items(self, search_index_rows: List[SearchIndexRow]) -> None:
+-        """Index multiple items in a single batch operation using UPSERT.
+-
+-        Uses INSERT ... ON CONFLICT to handle race conditions during parallel
+-        entity indexing. The partial unique index uix_search_index_permalink_project
+-        on (permalink, project_id) WHERE permalink IS NOT NULL prevents duplicate
+-        permalinks.
+-
+-        For rows with non-null permalinks (entities), conflicts are resolved by
+-        updating the existing row. For rows with null permalinks (observations,
+-        relations), the partial index doesn't apply and they are inserted directly.
++        """Replace each entity's search projection in one transaction.
++
++        Removing the previous projection also removes omitted observations,
++        relations, and renamed permalinks. FTS chunks cascade with their parent
++        rows and are rebuilt before the replacement transaction commits.
+ 
+         Args:
+             search_index_rows: List of SearchIndexRow objects to index
+         """
+ 
+         if not search_index_rows:
+             return
+ 
+         async with db.scoped_session(self.session_maker) as session:
++            entity_ids = sorted(
++                {row.entity_id for row in search_index_rows if row.entity_id is not None}
++            )
++            if entity_ids:
++                await session.execute(
++                    text(
++                        "DELETE FROM search_index "
++                        "WHERE entity_id = :entity_id AND project_id = :project_id"
++                    ),
++                    [
++                        {"entity_id": entity_id, "project_id": self.project_id}
++                        for entity_id in entity_ids
++                    ],
++                )
+             # When using text() raw SQL, always serialize JSON to string
+             # Both SQLite (TEXT) and Postgres (JSONB) accept JSON strings in raw SQL
+             # The database driver/column type will handle conversion
+             insert_data_list = []
+             for row in search_index_rows:
+--- a/src/basic_memory/repository/search_repository_base.py
++++ b/src/basic_memory/repository/search_repository_base.py
+@@ -9,16 +9,17 @@
+ from datetime import datetime
+ from typing import Any, Callable, Dict, List, Literal, Optional, cast
+ 
+ import logfire as logfire
+ from loguru import logger
+-from sqlalchemy import Executable, Result, inspect, text
++from sqlalchemy import Executable, Result, inspect, select, text
+ from sqlalchemy.engine import CursorResult
+ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+ 
+ from basic_memory import db
+ from basic_memory.config import BasicMemoryConfig
++from basic_memory.models.knowledge import Entity, entity_embeddings_enabled
+ from basic_memory.repository import semantic_vector_sync
+ from basic_memory.repository.embedding_provider import (
+     EmbeddingProvider,
+     embedding_provider_identity,
+ )
+@@ -981,13 +982,13 @@
+ 
+         async with db.scoped_session(self.session_maker) as session:
+             # Delete existing record if any
+             await session.execute(
+                 text(
+-                    "DELETE FROM search_index WHERE permalink = :permalink AND project_id = :project_id"
++                    "DELETE FROM search_index WHERE id = :id AND type = :type AND project_id = :project_id"
+                 ),
+-                {"permalink": search_index_row.permalink, "project_id": self.project_id},
++                {"id": search_index_row.id, "type": search_index_row.type, "project_id": self.project_id},
+             )
+ 
+             # When using text() raw SQL, always serialize JSON to string
+             # Both SQLite (TEXT) and Postgres (JSONB) accept JSON strings in raw SQL
+             # The database driver/column type will handle conversion
+@@ -1019,21 +1020,26 @@
+     async def bulk_index_items(self, search_index_rows: List[SearchIndexRow]) -> None:
+         """Index multiple items in a single batch operation.
+ 
+         This implementation is shared across backends as it uses standard SQL INSERT.
+ 
+-        Note: This method assumes that any existing records for the entity_id
+-        have already been deleted (typically via delete_by_entity_id).
++        Replace each entity's projection in the insertion transaction so parallel
++        indexers cannot append duplicate rows after a separate caller-side delete.
+ 
+         Args:
+             search_index_rows: List of SearchIndexRow objects to index
+         """
+ 
+         if not search_index_rows:  # pragma: no cover
+             return  # pragma: no cover
+ 
+         async with db.scoped_session(self.session_maker) as session:
++            await session.execute(
++                text("DELETE FROM search_index WHERE entity_id = :entity_id AND project_id = :project_id"),
++                [{"entity_id": entity_id, "project_id": self.project_id}
++                 for entity_id in sorted({row.entity_id for row in search_index_rows if row.entity_id is not None})],
++            )
+             # When using text() raw SQL, always serialize JSON to string
+             # Both SQLite (TEXT) and Postgres (JSONB) accept JSON strings in raw SQL
+             # The database driver/column type will handle conversion
+             insert_data_list = []
+             for row in search_index_rows:
+@@ -1702,16 +1708,28 @@
+     async def _fetch_prepare_window_source_rows(
+         self,
+         session: AsyncSession,
+         entity_ids: list[int],
+     ) -> dict[int, list[Any]]:
+-        """Fetch all search_index rows needed for one prepare window."""
+-        return await semantic_vector_sync.fetch_prepare_window_source_rows(
++        """Read searchable sources only for currently eligible entities."""
++        if not entity_ids:
++            return {}
++
++        result = await session.execute(
++            select(Entity)
++            .where(Entity.project_id == self.project_id, Entity.id.in_(entity_ids))
++            .execution_options(populate_existing=True)
++        )
++        eligible_ids = [
++            entity.id for entity in result.scalars() if entity_embeddings_enabled(entity)
++        ]
++        source_rows = await semantic_vector_sync.fetch_prepare_window_source_rows(
+             self,
+             session,
+-            entity_ids,
+-        )
++            eligible_ids,
++        )
++        return {entity_id: source_rows.get(entity_id, []) for entity_id in entity_ids}
+ 
+     def _prepare_window_existing_rows_sql(self, placeholders: str) -> str:
+         """SQL for existing chunk/embedding rows in one prepare window."""
+         return semantic_vector_sync.prepare_window_existing_rows_sql(placeholders)
+ 
+@@ -1850,10 +1868,16 @@
+ 
+         Default implementation is a no-op. SQLite overrides this.
+         """
+         pass
+ 
++    async def _prepare_vector_write_session(self, session: AsyncSession) -> bool:
++        """Acquire write protection and report whether plans need a fresh snapshot."""
++        await self._prepare_vector_session(session)
++        await self._lock_external_vector_write(session)
++        return self._uses_external_vector_index()
++
+     def _timestamp_now_expr(self) -> str:
+         """SQL expression for 'now' in the backend.
+ 
+         SQLite uses CURRENT_TIMESTAMP, Postgres uses NOW().
+         """
+--- a/src/basic_memory/repository/semantic_vector_sync.py
++++ b/src/basic_memory/repository/semantic_vector_sync.py
+@@ -791,21 +791,16 @@
+             # Neon round-trip and repeated writer setup for the same window.
+             # Outcome: apply the planned mutations in input order and commit
+             # the whole window once; skip-only entities never enter the write.
+             async with repository._prepare_entity_write_scope():
+                 async with db.scoped_session(repository.session_maker) as session:
+-                    await repository._prepare_vector_session(session)
+-                    await repository._lock_external_vector_write(session)
++                    refresh_snapshot = await repository._prepare_vector_write_session(session)
+                     plans_to_apply = mutation_plans
+-                    if repository._uses_external_vector_index():
+-                        # Trigger: entity deletion can finish after the shared read
+-                        # snapshot but before this prepare transaction gets the
+-                        # project lock.
+-                        # Why: applying that stale plan would recreate a manifest
+-                        # for an entity the delete just removed.
+-                        # Outcome: external writes re-read and re-plan under the
+-                        # shared lock before making any manifest mutation.
++                    if refresh_snapshot:
++                        # Another writer may have changed or deleted the source
++                        # after our first read. Re-plan under the database lock
++                        # so an older job cannot overwrite the current manifest.
+                         mutation_entity_ids = [plan.entity_id for _index, plan in mutation_plans]
+                         locked_source_rows = await repository._fetch_prepare_window_source_rows(
+                             session,
+                             mutation_entity_ids,
+                         )
+@@ -885,14 +880,13 @@
+     if isinstance(planned, PreparedEntityVectorSync):
+         return planned
+ 
+     async with repository._prepare_entity_write_scope():
+         async with db.scoped_session(repository.session_maker) as session:
+-            await repository._prepare_vector_session(session)
+-            await repository._lock_external_vector_write(session)
++            refresh_snapshot = await repository._prepare_vector_write_session(session)
+             locked_plan = planned
+-            if repository._uses_external_vector_index():
++            if refresh_snapshot:
+                 locked_source_rows = await repository._fetch_prepare_window_source_rows(
+                     session,
+                     [entity_id],
+                 )
+                 locked_existing_rows = await repository._fetch_prepare_window_existing_rows(
+--- a/src/basic_memory/repository/sqlite_search_repository.py
++++ b/src/basic_memory/repository/sqlite_search_repository.py
+@@ -621,10 +621,18 @@
+ 
+     @override
+     async def _prepare_vector_session(self, session: AsyncSession) -> None:
+         """Load sqlite-vec extension for the session."""
+         await self._ensure_sqlite_vec_loaded(session)
++
++    @override
++    async def _prepare_vector_write_session(self, session: AsyncSession) -> bool:
++        """Hold SQLite's writer lock while reading and applying the current plan."""
++        await self._prepare_vector_session(session)
++        await session.execute(text("BEGIN IMMEDIATE"))
++        await self._lock_external_vector_write(session)
++        return True
+ 
+     # sqlite-vec hard limit for knn k parameter
+     SQLITE_VEC_MAX_K = 4096
+ 
+     @override
+--- a/src/basic_memory/services/search_service.py
++++ b/src/basic_memory/services/search_service.py
+@@ -15,10 +15,11 @@
+ 
+ import logfire
+ 
+ from basic_memory import db
+ from basic_memory.models import Entity
++from basic_memory.models.knowledge import entity_embeddings_enabled
+ from basic_memory.repository import EntityRepository
+ from basic_memory.repository.search_repository import (
+     SearchIndexRow,
+     SearchRepository,
+ )
+@@ -50,38 +51,10 @@
+     categories: list[str] | None
+     after_date: datetime | None
+     metadata_filters: dict[str, Any] | None
+     retrieval_mode: SearchRetrievalMode
+     min_similarity: float | None
+-
+-
+-def entity_embeddings_enabled(entity: Entity) -> bool:
+-    """Return whether semantic embeddings should be generated for this entity.
+-
+-    Shared policy: sync uses it to clear and skip opted-out notes, and the retrieval
+-    inspector uses it so an opt-out is never reported as missing vector coverage.
+-    """
+-    if not entity.entity_metadata:
+-        return True
+-
+-    embed_value = entity.entity_metadata.get("embed")
+-    if embed_value is None:
+-        return True
+-    if isinstance(embed_value, bool):
+-        return embed_value
+-    if isinstance(embed_value, str):
+-        normalized = embed_value.strip().lower()
+-        if normalized in {"false", "0", "no", "off"}:
+-            return False
+-        if normalized in {"true", "1", "yes", "on"}:
+-            return True
+-    if isinstance(embed_value, (int, float)):
+-        return bool(embed_value)
+-
+-    # Default unknown values to enabled so malformed metadata does not silently
+-    # remove notes from semantic search.
+-    return True
+ 
+ 
+ def describe_search_criteria(prepared: PreparedSearchQuery) -> str:
+     """Render the criteria the repository actually executed.
+ 
+@@ -569,12 +542,10 @@
+                 if entity.is_markdown and replacement_content is None:
+                     # Trigger: synchronized and legacy notes source search text from storage.
+                     # Why: a transient read failure must preserve the last valid projection.
+                     # Outcome: storage errors remain visible before any search rows are deleted.
+                     replacement_content = await self.file_service.read_entity_content(entity)
+-
+-                await self.repository.delete_by_entity_id(entity_id=entity.id)
+ 
+                 if entity.is_markdown:
+                     await self.index_entity_markdown(entity, replacement_content)
+                 else:
+                     await self.index_entity_file(entity)
+@@ -780,25 +751,27 @@
+     async def index_entity_file(
+         self,
+         entity: Entity,
+     ) -> None:
+         # Index entity file with no content
+-        await self.repository.index_item(
+-            SearchIndexRow(
+-                id=entity.id,
+-                entity_id=entity.id,
+-                type=SearchItemType.ENTITY.value,
+-                title=_strip_nul(entity.title),
+-                permalink=entity.permalink,  # Required for Postgres NOT NULL constraint
+-                file_path=entity.file_path,
+-                metadata={
+-                    "note_type": normalize_note_type(entity.note_type),
+-                },
+-                created_at=entity.created_at,
+-                updated_at=entity.updated_at,
+-                project_id=entity.project_id,
+-            )
++        await self.repository.bulk_index_items(
++            [
++                SearchIndexRow(
++                    id=entity.id,
++                    entity_id=entity.id,
++                    type=SearchItemType.ENTITY.value,
++                    title=_strip_nul(entity.title),
++                    permalink=entity.permalink,  # Required for Postgres NOT NULL constraint
++                    file_path=entity.file_path,
++                    metadata={
++                        "note_type": normalize_note_type(entity.note_type),
++                    },
++                    created_at=entity.created_at,
++                    updated_at=entity.updated_at,
++                    project_id=entity.project_id,
++                )
++            ]
+         )
+ 
+     async def index_entity_markdown(
+         self,
+         entity: Entity,
