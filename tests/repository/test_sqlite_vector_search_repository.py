@@ -1558,7 +1558,9 @@ async def test_sqlite_prepare_window_uses_shared_reads_and_serialized_write_scop
     prepared = await repo._prepare_entity_vector_jobs_window([1, 2])
     prepared_results = [result for result in prepared if not isinstance(result, BaseException)]
 
-    assert fetched_windows == [[1, 2]]
+    # One shared read plans the window; the write re-reads the entities it mutates
+    # under SQLite's write lock, so a plan that went stale meanwhile is never applied.
+    assert fetched_windows == [[1, 2], [1, 2]]
     assert [result.entity_id for result in prepared_results] == [1, 2]
     assert max_active_write_scopes == 1
     assert write_scope_entries == 1

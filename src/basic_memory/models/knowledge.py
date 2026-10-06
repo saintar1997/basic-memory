@@ -183,6 +183,35 @@ class Entity(Base):
         return f"Entity(id={self.id}, external_id='{self.external_id}', name='{self.title}', type='{self.note_type}', checksum='{self.checksum}')"
 
 
+def entity_embeddings_enabled(entity: Entity) -> bool:
+    """Return whether semantic embeddings should be generated for this entity.
+
+    Shared policy: sync uses it to clear and skip opted-out notes, vector preparation
+    uses it so delayed work cannot re-embed an opted-out note, and the retrieval
+    inspector uses it so an opt-out is never reported as missing vector coverage.
+    """
+    if not entity.entity_metadata:
+        return True
+
+    embed_value = entity.entity_metadata.get("embed")
+    if embed_value is None:
+        return True
+    if isinstance(embed_value, bool):
+        return embed_value
+    if isinstance(embed_value, str):
+        normalized = embed_value.strip().lower()
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+    if isinstance(embed_value, (int, float)):
+        return bool(embed_value)
+
+    # Default unknown values to enabled so malformed metadata does not silently
+    # remove notes from semantic search.
+    return True
+
+
 class NoteContent(Base):
     """Materialized markdown content and sync state for a note entity."""
 

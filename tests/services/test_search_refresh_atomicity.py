@@ -144,3 +144,78 @@ async def test_fts_chunk_failure_keeps_previous_rows_and_chunks(
     monkeypatch.undo()
     await search_service.index_entity_data(entity, content="replacement body")
     assert await _fts_chunk_count(session_maker, entity) == before_chunks
+
+
+async def _row_keys(search_service, entity: Entity) -> list[tuple[str, int, str | None]]:
+    """Every stored row the entity owns, keyed by kind, id and permalink; duplicates kept."""
+    rows = await search_service.repository.get_entity_search_rows(entity.id)
+    return sorted((row.type, row.id, row.permalink) for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_file_without_a_permalink_keeps_one_row_across_refreshes(
+    search_service, entity_repository, session_maker
+):
+    """A row without a permalink has no address to replace, only an owning entity."""
+    async with db.scoped_session(session_maker) as session:
+        scan = await entity_repository.create(
+            session,
+            {
+                "project_id": entity_repository.project_id,
+                "title": "scan.pdf",
+                "note_type": "file",
+                "permalink": None,
+                "file_path": "files/scan.pdf",
+                "content_type": "application/pdf",
+            },
+        )
+    assert not scan.is_markdown
+
+    for _ in range(3):
+        await search_service.index_entity_data(scan)
+
+    assert await _row_keys(search_service, scan) == [("entity", scan.id, None)]
+
+
+@pytest.mark.asyncio
+async def test_refresh_under_a_renamed_permalink_leaves_no_old_rows(
+    db_backend, search_service, full_entity, entity_repository, session_maker
+):
+    entity = await _reload(session_maker, entity_repository, full_entity)
+    await search_service.index_entity_data(entity, content="renamed body")
+    old_permalink = entity.permalink
+    assert old_permalink is not None
+    before = await _row_keys(search_service, entity)
+    chunks_before = (
+        await _fts_chunk_count(session_maker, entity) if db_backend == "postgres" else None
+    )
+
+    async with db.scoped_session(session_maker) as session:
+        await entity_repository.update(session, entity.id, {"permalink": "test/renamed-entity"})
+    entity = await _reload(session_maker, entity_repository, full_entity)
+    await search_service.index_entity_data(entity, content="renamed body")
+
+    after = await _row_keys(search_service, entity)
+    assert [(kind, row_id) for kind, row_id, _ in after] == [
+        (kind, row_id) for kind, row_id, _ in before
+    ]
+    assert all(
+        permalink is not None and not permalink.startswith(old_permalink) for *_, permalink in after
+    )
+    if db_backend == "postgres":
+        # Chunks cascade with the old rows and are rebuilt for the replacement rows.
+        assert await _fts_chunk_count(session_maker, entity) == chunks_before
+
+
+@pytest.mark.asyncio
+async def test_markdown_note_refreshed_as_a_file_keeps_only_its_entity_row(
+    search_service, full_entity, entity_repository, session_maker
+):
+    entity = await _reload(session_maker, entity_repository, full_entity)
+    await search_service.index_entity_data(entity, content="markdown body")
+    assert len(await _row_keys(search_service, entity)) == 5
+
+    entity.content_type = "application/pdf"
+    await search_service.index_entity_data(entity)
+
+    assert await _row_keys(search_service, entity) == [("entity", entity.id, entity.permalink)]
