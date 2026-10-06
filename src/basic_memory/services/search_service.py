@@ -19,6 +19,7 @@ import logfire
 from basic_memory import db
 from basic_memory.indexing.relation_resolution import RelationSearchRefreshResult
 from basic_memory.models import Entity
+from basic_memory.models.knowledge import entity_embeddings_enabled
 from basic_memory.repository import EntityRepository
 from basic_memory.repository.search_repository import (
     SearchIndexRow,
@@ -42,34 +43,6 @@ from basic_memory.temporal import (
 # Maximum size for content_stems field to stay under Postgres's 8KB index row limit.
 # We use 6000 characters to leave headroom for other indexed columns and overhead.
 MAX_CONTENT_STEMS_SIZE = 6000
-
-
-def entity_embeddings_enabled(entity: Entity) -> bool:
-    """Return whether semantic embeddings should be generated for this entity.
-
-    Shared policy: sync uses it to clear and skip opted-out notes, and the retrieval
-    inspector uses it so an opt-out is never reported as missing vector coverage.
-    """
-    if not entity.entity_metadata:
-        return True
-
-    embed_value = entity.entity_metadata.get("embed")
-    if embed_value is None:
-        return True
-    if isinstance(embed_value, bool):
-        return embed_value
-    if isinstance(embed_value, str):
-        normalized = embed_value.strip().lower()
-        if normalized in {"false", "0", "no", "off"}:
-            return False
-        if normalized in {"true", "1", "yes", "on"}:
-            return True
-    if isinstance(embed_value, (int, float)):
-        return bool(embed_value)
-
-    # Default unknown values to enabled so malformed metadata does not silently
-    # remove notes from semantic search.
-    return True
 
 
 def build_temporal_filter(query: SearchQuery) -> TemporalFilter | None:

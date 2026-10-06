@@ -327,6 +327,21 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         await self._ensure_sqlite_vec_loaded(session)
 
     @override
+    async def _prepare_vector_write_session(self, session: AsyncSession) -> bool:
+        """Take SQLite's write lock before any read, then re-plan under it."""
+        await self._prepare_vector_session(session)
+        # Trigger: every SQLite prepare write, built-in sqlite-vec included.
+        # Why: the plan comes from a read taken before this write. Other processes and
+        #   other repository instances (each request builds its own, so the asyncio lock
+        #   above is not shared) can refresh the note and publish a newer manifest in
+        #   between, and an older plan would then rewrite those chunk rows back to older
+        #   text. SQLite has one database-wide writer, so a write first is the
+        #   BEGIN IMMEDIATE of this transaction: the re-read it guards cannot go stale.
+        # Outcome: the caller re-reads source and manifest and applies only a current plan.
+        await self._lock_external_vector_project(session, dialect_name="sqlite")
+        return True
+
+    @override
     async def _delete_entity_chunks(
         self,
         session: AsyncSession,

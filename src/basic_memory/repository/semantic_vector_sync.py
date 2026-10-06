@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING, Any
 
 import logfire
 from loguru import logger
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from basic_memory import db
+from basic_memory.models.knowledge import Entity, entity_embeddings_enabled
 from basic_memory.repository.semantic_chunking import VectorChunkRecord
 from basic_memory.runtime.vector_sync import (
     VECTOR_SYNC_SAMPLE_ERROR_LIMIT,
@@ -672,12 +673,34 @@ async def fetch_prepare_window_source_rows(
     session: AsyncSession,
     entity_ids: list[int],
 ) -> dict[int, list[Any]]:
-    """Fetch all search_index rows needed for one prepare window."""
+    """Fetch the search_index rows that embeddings are built from, for one prepare window.
+
+    A note that opted out of embeddings has no semantic source, whatever its
+    full-text rows say.
+    """
     grouped_rows: dict[int, list[Any]] = {entity_id: [] for entity_id in entity_ids}
     if not entity_ids:
         return grouped_rows
 
-    placeholders, params = repository._prepare_window_entity_params(entity_ids)
+    # Trigger: an embedding opt-out committed after this sync was scheduled, which is
+    #   when SearchService last checked the note's eligibility.
+    # Why: an opted-out note keeps its full-text rows, so they alone would plan an
+    #   upsert and re-embed the note after the opt-out removed its vectors.
+    # Outcome: the opted-out note reads as having no source and its plan removes vectors.
+    entity_result = await session.execute(
+        select(Entity).where(
+            Entity.project_id == repository.project_id,
+            Entity.id.in_(entity_ids),
+        )
+    )
+    opted_out_ids = {
+        entity.id for entity in entity_result.scalars() if not entity_embeddings_enabled(entity)
+    }
+    source_entity_ids = [entity_id for entity_id in entity_ids if entity_id not in opted_out_ids]
+    if not source_entity_ids:
+        return grouped_rows
+
+    placeholders, params = repository._prepare_window_entity_params(source_entity_ids)
     params.update(
         {
             "entity_type": SearchItemType.ENTITY.value,
@@ -802,17 +825,17 @@ async def prepare_entity_vector_jobs_window(
             # the whole window once; skip-only entities never enter the write.
             async with repository._prepare_entity_write_scope():
                 async with db.scoped_session(repository.session_maker) as session:
-                    await repository._prepare_vector_session(session)
-                    await repository._lock_external_vector_write(session)
+                    replan_under_lock = await repository._prepare_vector_write_session(session)
                     plans_to_apply = mutation_plans
-                    if repository._uses_external_vector_index():
-                        # Trigger: entity deletion can finish after the shared read
-                        # snapshot but before this prepare transaction gets the
-                        # project lock.
-                        # Why: applying that stale plan would recreate a manifest
-                        # for an entity the delete just removed.
-                        # Outcome: external writes re-read and re-plan under the
-                        # shared lock before making any manifest mutation.
+                    if replan_under_lock:
+                        # Trigger: a deletion, an opt-out, or another sync's newer
+                        # manifest can commit after the shared read snapshot but
+                        # before this prepare transaction gets its write lock.
+                        # Why: applying that stale plan would recreate a manifest for
+                        # an entity the delete just removed, or rewrite newer chunk
+                        # rows back to older text.
+                        # Outcome: backends whose lock covers the re-read re-plan
+                        # under it before making any manifest mutation.
                         mutation_entity_ids = [plan.entity_id for _index, plan in mutation_plans]
                         locked_source_rows = await repository._fetch_prepare_window_source_rows(
                             session,
@@ -896,10 +919,9 @@ async def prepare_entity_vector_jobs_prefetched(
 
     async with repository._prepare_entity_write_scope():
         async with db.scoped_session(repository.session_maker) as session:
-            await repository._prepare_vector_session(session)
-            await repository._lock_external_vector_write(session)
+            replan_under_lock = await repository._prepare_vector_write_session(session)
             locked_plan = planned
-            if repository._uses_external_vector_index():
+            if replan_under_lock:
                 locked_source_rows = await repository._fetch_prepare_window_source_rows(
                     session,
                     [entity_id],

@@ -1256,6 +1256,18 @@ class SearchRepositoryBase(ABC):
             dialect_name=connection.dialect.name,
         )
 
+    async def _prepare_vector_write_session(self, session: AsyncSession) -> bool:
+        """Open a prepare write; return whether its plans must be re-read under its lock.
+
+        External adapters re-plan under the shared project lock. Built-in indexes apply
+        the plan their window read: at READ COMMITTED a re-read without a lock cannot
+        keep a plan current, and the project row lock would also stall the project's
+        inserts, whose foreign-key checks share-lock that row. SQLite overrides this.
+        """
+        await self._prepare_vector_session(session)
+        await self._lock_external_vector_write(session)
+        return self._uses_external_vector_index()
+
     def _uses_external_vector_index(self) -> bool:
         """Return whether this repository writes vectors outside the SQL backend."""
         return self._semantic_vector_index_name not in BUILT_IN_VECTOR_INDEX_NAMES and hasattr(
